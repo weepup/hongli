@@ -3,11 +3,10 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import yfinance as yf
-from datetime import datetime
 
 st.set_page_config(page_title="红利低波 对数通道分析", layout="wide")
 st.title("🟠 红利/红利低波 对数坐标通道分析系统")
-st.caption("数据接口：Yahoo Finance | 原理：对数线性回归 + 1.5σ 通道 | 已升级交易信号灯")
+st.caption("数据接口：Yahoo Finance | 原理：对数线性回归 + 可调 σ 通道 | 交易信号灯")
 
 # ================== ETF 列表 ==================
 etf_list = {
@@ -28,7 +27,7 @@ with st.sidebar:
     period_option = st.selectbox(
         "选择回溯周期",
         ["全历史", "最近 2 年", "最近 3 年", "自定义起始日期"],
-        index=3  # 默认自定义，更贴近当前市场
+        index=2  # 默认最近 3 年
     )
     if period_option == "自定义起始日期":
         start_date_input = st.date_input(
@@ -36,7 +35,13 @@ with st.sidebar:
             value=pd.Timestamp.now() - pd.DateOffset(years=3),
             min_value=pd.Timestamp("2010-01-01")
         )
-    st.info("💡 推荐用「最近 3 年」或自定义，能让趋势线更贴近当前市场")
+        custom_start = pd.to_datetime(start_date_input)
+    else:
+        custom_start = None
+    
+    st.subheader("通道参数")
+    sigma_multiplier = st.slider("通道宽度 (σ 倍数)", min_value=1.0, max_value=2.5, value=1.5, step=0.1)
+    st.info("💡 推荐保持 1.5σ，数值越大通道越宽")
 
 # ================== 获取数据 ==================
 @st.cache_data(ttl=3600)
@@ -46,6 +51,7 @@ def fetch_data(ticker):
         st.error(f"❌ {ticker} 暂无数据")
         st.stop()
     df = df.reset_index()
+    # 统一列名（更稳健）
     if "Date" in df.columns:
         df = df.rename(columns={"Date": "datetime"})
     if "Close" in df.columns:
@@ -67,11 +73,13 @@ elif period_option == "最近 3 年":
     cutoff = pd.Timestamp.now() - pd.DateOffset(years=3)
     df = df_full[df_full["datetime"] >= cutoff].copy()
 else:
-    cutoff = pd.to_datetime(start_date_input)
+    cutoff = custom_start
     df = df_full[df_full["datetime"] >= cutoff].copy()
 
-if len(df) < 252:
-    st.warning("⚠️ 所选周期数据不足 1 年，回归结果可能不稳定，仅供参考。")
+# 防止过滤后数据太少
+if len(df) < 100:
+    st.warning(f"⚠️ 所选周期数据不足 {len(df)} 条，已自动切换到全历史")
+    df = df_full.copy()
 
 # ================== 计算对数回归通道 ==================
 df["log_close"] = np.log(df["close"])
@@ -85,8 +93,10 @@ df["trend"] = np.exp(df["trend_log"])
 
 residuals = y - df["trend_log"]
 sigma = np.std(residuals)
-df["upper"] = np.exp(df["trend_log"] + 1.5 * sigma)
-df["lower"] = np.exp(df["trend_log"] - 1.5 * sigma)
+
+# 使用用户可调的 σ 倍数
+df["upper"] = np.exp(df["trend_log"] + sigma_multiplier * sigma)
+df["lower"] = np.exp(df["trend_log"] - sigma_multiplier * sigma)
 
 annualized = (np.exp(slope * 252) - 1) * 100
 
@@ -102,13 +112,13 @@ lower_price = latest["lower"]
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("最新净值", f"{current_price:.3f}", f"{current_date}")
 col2.metric("趋势值", f"{trend_price:.3f}")
-col3.metric("1.5σ 上轨", f"{upper_price:.3f}")
-col4.metric("1.5σ 下轨", f"{lower_price:.3f}")
+col3.metric(f"{sigma_multiplier}σ 上轨", f"{upper_price:.3f}")
+col4.metric(f"{sigma_multiplier}σ 下轨", f"{lower_price:.3f}")
 
 st.success(f"**{selected_etf_name}**  趋势年化收益 ≈ **{annualized:.1f}%**")
 
 # ================== 交易信号灯 + 建议 ==================
-price_position = (current_price - lower_price) / (upper_price - lower_price)  # 0~1
+price_position = (current_price - lower_price) / (upper_price - lower_price) if (upper_price - lower_price) != 0 else 0.5
 
 if price_position <= 0.15:
     signal_emoji = "🟢"
@@ -127,7 +137,6 @@ else:
     signal_text = "减仓信号"
     suggestion = "最新净值**接近或高于上轨**，估值偏高。建议**分批减仓锁定收益**，等回落再加。"
 
-# 趋势斜率额外提醒
 if annualized < 5:
     suggestion += "\n\n⚠️ 注意：当前长期趋势走平/向下，整体仓位请控制在 60% 以内。"
 
@@ -139,8 +148,8 @@ st.info(suggestion)
 fig = go.Figure()
 fig.add_trace(go.Scatter(x=df["datetime"], y=df["close"], name="基金净值", line=dict(color="#1f77b4")))
 fig.add_trace(go.Scatter(x=df["datetime"], y=df["trend"], name="对数回归趋势线 (中轨)", line=dict(color="#d62728", dash="dash")))
-fig.add_trace(go.Scatter(x=df["datetime"], y=df["upper"], name="1.5σ 上轨", line=dict(color="#ff7f0e", dash="dot")))
-fig.add_trace(go.Scatter(x=df["datetime"], y=df["lower"], name="1.5σ 下轨", line=dict(color="#ff7f0e", dash="dot"), fill="tonexty", fillcolor="rgba(255, 165, 0, 0.15)"))
+fig.add_trace(go.Scatter(x=df["datetime"], y=df["upper"], name=f"{sigma_multiplier}σ 上轨", line=dict(color="#ff7f0e", dash="dot")))
+fig.add_trace(go.Scatter(x=df["datetime"], y=df["lower"], name=f"{sigma_multiplier}σ 下轨", line=dict(color="#ff7f0e", dash="dot"), fill="tonexty", fillcolor="rgba(255, 165, 0, 0.15)"))
 
 fig.update_layout(
     title=f"{selected_etf_name} 对数坐标通道分析<br>（年化收益 ≈ {annualized:.1f}%）",
