@@ -3,12 +3,13 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import yfinance as yf
+from datetime import datetime
 
 st.set_page_config(page_title="红利低波 对数通道分析", layout="wide")
 st.title("🟠 红利/红利低波 对数坐标通道分析系统")
-st.caption("数据接口：Yahoo Finance (yfinance) | 原理：对数线性回归 + 1.5σ 通道 | 已修复 KeyError")
+st.caption("数据接口：Yahoo Finance | 原理：对数线性回归 + 1.5σ 通道 | 已升级交易信号灯")
 
-# ================== 预设基金列表 ==================
+# ================== ETF 列表 ==================
 etf_list = {
     "中证红利 (515080)": "515080.SS",
     "红利低波 (512890)": "512890.SS",
@@ -22,48 +23,55 @@ with st.sidebar:
     st.header("配置")
     selected_etf_name = st.selectbox("选择 ETF", options=list(etf_list.keys()))
     ticker = etf_list[selected_etf_name]
-    st.info("💡 数据自动更新，无需 API Key")
+    
+    st.subheader("数据周期")
+    period_option = st.selectbox(
+        "选择回溯周期",
+        ["全历史", "最近 2 年", "最近 3 年", "自定义起始日期"],
+        index=3  # 默认自定义，更贴近当前市场
+    )
+    if period_option == "自定义起始日期":
+        start_date_input = st.date_input(
+            "起始日期",
+            value=pd.Timestamp.now() - pd.DateOffset(years=3),
+            min_value=pd.Timestamp("2010-01-01")
+        )
+    st.info("💡 推荐用「最近 3 年」或自定义，能让趋势线更贴近当前市场")
 
-# ================== 获取数据（已加固） ==================
+# ================== 获取数据 ==================
 @st.cache_data(ttl=3600)
 def fetch_data(ticker):
-    try:
-        # 使用 Ticker.history，更稳定
-        df = yf.Ticker(ticker).history(period="max", interval="1d")
-        if df.empty:
-            st.error(f"❌ {ticker} 暂无数据，请稍后重试或检查网络。")
-            st.stop()
-        
-        # 重置索引并处理各种可能的列名情况
-        df = df.reset_index()
-        
-        # 处理可能的 MultiIndex（极少数情况）
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
-        
-        # 统一列名
-        if "Date" in df.columns:
-            df = df.rename(columns={"Date": "datetime"})
-        elif "datetime" in df.columns:
-            pass  # 已有
-        
-        # 优先使用 Close，其次 Adj Close
-        if "Close" in df.columns:
-            df = df.rename(columns={"Close": "close"})
-        elif "Adj Close" in df.columns:
-            df = df.rename(columns={"Adj Close": "close"})
-        else:
-            st.error(f"❌ 数据列异常！当前列名：{list(df.columns)}")
-            st.error("请把上面这行列名截图发给我，我马上修复。")
-            st.stop()
-        
-        df = df[["datetime", "close"]].dropna(subset=["close"]).reset_index(drop=True)
-        return df
-    except Exception as e:
-        st.error(f"数据获取失败: {str(e)}")
+    df = yf.Ticker(ticker).history(period="max", interval="1d")
+    if df.empty:
+        st.error(f"❌ {ticker} 暂无数据")
         st.stop()
+    df = df.reset_index()
+    if "Date" in df.columns:
+        df = df.rename(columns={"Date": "datetime"})
+    if "Close" in df.columns:
+        df = df.rename(columns={"Close": "close"})
+    elif "Adj Close" in df.columns:
+        df = df.rename(columns={"Adj Close": "close"})
+    df = df[["datetime", "close"]].dropna(subset=["close"]).reset_index(drop=True)
+    return df
 
-df = fetch_data(ticker)
+df_full = fetch_data(ticker)
+
+# ================== 根据周期过滤数据 ==================
+if period_option == "全历史":
+    df = df_full.copy()
+elif period_option == "最近 2 年":
+    cutoff = pd.Timestamp.now() - pd.DateOffset(years=2)
+    df = df_full[df_full["datetime"] >= cutoff].copy()
+elif period_option == "最近 3 年":
+    cutoff = pd.Timestamp.now() - pd.DateOffset(years=3)
+    df = df_full[df_full["datetime"] >= cutoff].copy()
+else:
+    cutoff = pd.to_datetime(start_date_input)
+    df = df_full[df_full["datetime"] >= cutoff].copy()
+
+if len(df) < 252:
+    st.warning("⚠️ 所选周期数据不足 1 年，回归结果可能不稳定，仅供参考。")
 
 # ================== 计算对数回归通道 ==================
 df["log_close"] = np.log(df["close"])
@@ -99,6 +107,34 @@ col4.metric("1.5σ 下轨", f"{lower_price:.3f}")
 
 st.success(f"**{selected_etf_name}**  趋势年化收益 ≈ **{annualized:.1f}%**")
 
+# ================== 交易信号灯 + 建议 ==================
+price_position = (current_price - lower_price) / (upper_price - lower_price)  # 0~1
+
+if price_position <= 0.15:
+    signal_emoji = "🟢"
+    signal_text = "强买信号"
+    suggestion = "最新净值**接近或低于下轨**，安全边际极高！建议**分批加仓**（每次 20-30% 仓位）。"
+elif price_position <= 0.45:
+    signal_emoji = "🟢"
+    signal_text = "买入/轻加"
+    suggestion = "净值处于通道**下半部**，性价比好。建议**小批加仓**或维持现有仓位。"
+elif price_position <= 0.75:
+    signal_emoji = "🟡"
+    signal_text = "持有"
+    suggestion = "净值在**趋势线附近**，正常波动。**继续持有**观察即可。"
+else:
+    signal_emoji = "🔴"
+    signal_text = "减仓信号"
+    suggestion = "最新净值**接近或高于上轨**，估值偏高。建议**分批减仓锁定收益**，等回落再加。"
+
+# 趋势斜率额外提醒
+if annualized < 5:
+    suggestion += "\n\n⚠️ 注意：当前长期趋势走平/向下，整体仓位请控制在 60% 以内。"
+
+st.subheader("📊 交易信号灯 & 操作建议")
+st.markdown(f"### {signal_emoji} **{signal_text}**")
+st.info(suggestion)
+
 # ================== 画图 ==================
 fig = go.Figure()
 fig.add_trace(go.Scatter(x=df["datetime"], y=df["close"], name="基金净值", line=dict(color="#1f77b4")))
@@ -116,10 +152,8 @@ fig.update_layout(
     hovermode="x unified",
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
 )
-
 st.plotly_chart(fig, use_container_width=True)
 
 st.download_button("下载历史数据 CSV", df.to_csv(index=False), f"{selected_etf_name}_channel_data.csv", "text/csv")
 
-st.markdown("---")
-st.caption("原理：对数净值线性回归 + 1.5σ 通道")
+st.caption("信号仅供参考 · 坚持分批买卖 · 非实时交易指令")
